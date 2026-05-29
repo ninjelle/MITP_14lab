@@ -6,8 +6,10 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"os/signal"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"golang.org/x/net/html"
@@ -22,19 +24,19 @@ type Product struct {
 }
 
 type BatchWriter struct {
-	file        *os.File
-	buffer      []Product
-	bufferSize  int         
-	flushInterval time.Duration 
-	ticker      *time.Ticker
-	mu          sync.Mutex
-	stopCh      chan struct{}
+	file          *os.File
+	buffer        []Product
+	bufferSize    int
+	flushInterval time.Duration
+	ticker        *time.Ticker
+	mu            sync.Mutex
+	stopCh        chan struct{}
+	closed        bool
 }
 
 func NewBatchWriter(filename string, bufferSize int, flushInterval time.Duration) (*BatchWriter, error) {
-	
 	os.MkdirAll("../data", 0755)
-	
+
 	file, err := os.Create(filename)
 	if err != nil {
 		return nil, err
@@ -47,6 +49,7 @@ func NewBatchWriter(filename string, bufferSize int, flushInterval time.Duration
 		flushInterval: flushInterval,
 		ticker:        time.NewTicker(flushInterval),
 		stopCh:        make(chan struct{}),
+		closed:        false,
 	}
 
 	go bw.autoFlush()
@@ -57,6 +60,10 @@ func NewBatchWriter(filename string, bufferSize int, flushInterval time.Duration
 func (bw *BatchWriter) Add(product Product) {
 	bw.mu.Lock()
 	defer bw.mu.Unlock()
+
+	if bw.closed {
+		return
+	}
 
 	bw.buffer = append(bw.buffer, product)
 
@@ -80,8 +87,8 @@ func (bw *BatchWriter) flush() {
 		bw.file.WriteString("\n")
 	}
 
-	fmt.Printf("📦 Сброшено в файл: %d записей\n", len(bw.buffer))
-	bw.buffer = bw.buffer[:0] // очищаем буфер
+	fmt.Printf("Сброшено в файл: %d записей\n", len(bw.buffer))
+	bw.buffer = bw.buffer[:0]
 }
 
 func (bw *BatchWriter) autoFlush() {
@@ -89,7 +96,9 @@ func (bw *BatchWriter) autoFlush() {
 		select {
 		case <-bw.ticker.C:
 			bw.mu.Lock()
-			bw.flush()
+			if !bw.closed {
+				bw.flush()
+			}
 			bw.mu.Unlock()
 		case <-bw.stopCh:
 			return
@@ -98,11 +107,16 @@ func (bw *BatchWriter) autoFlush() {
 }
 
 func (bw *BatchWriter) Close() error {
-	bw.ticker.Stop()
-	close(bw.stopCh)
-
 	bw.mu.Lock()
 	defer bw.mu.Unlock()
+
+	if bw.closed {
+		return nil
+	}
+
+	bw.closed = true
+	bw.ticker.Stop()
+	close(bw.stopCh)
 	bw.flush()
 
 	return bw.file.Close()
@@ -194,8 +208,8 @@ func extractProduct(n *html.Node, pageURL string) Product {
 }
 
 func main() {
-	totalPages := 20
-	
+	totalPages := 50
+
 	batchWriter, err := NewBatchWriter("../data/products.json", 10, 3*time.Second)
 	if err != nil {
 		log.Fatal("Не могу создать BatchWriter:", err)
@@ -205,15 +219,39 @@ func main() {
 	productsCh := make(chan Product, 200)
 	var wg sync.WaitGroup
 
-	fmt.Println("🚀 Запуск параллельного сбора данных...")
-	fmt.Printf("   Пакетная запись: %d записей или каждые %v\n\n", 10, 3*time.Second)
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
+
+	ctx := make(chan bool)
+
+	go func() {
+		<-sigChan
+		fmt.Println("\nПолучен сигнал завершения, выполняем graceful shutdown...")
+		close(ctx)
+	}()
+
+	fmt.Println("Запуск параллельного сбора данных...")
+	fmt.Printf("Пакетная запись: %d записей или каждые %v\n", 10, 3*time.Second)
+	fmt.Println("Для остановки нажмите Ctrl+C\n")
 
 	startTime := time.Now()
 
 	for i := 1; i <= totalPages; i++ {
+		select {
+		case <-ctx:
+			break
+		default:
+		}
+
 		wg.Add(1)
 		go func(page int) {
 			defer wg.Done()
+
+			select {
+			case <-ctx:
+				return
+			default:
+			}
 
 			fmt.Printf("Парсим страницу %d...\n", page)
 			products, err := parsePage(page)
@@ -223,7 +261,11 @@ func main() {
 			}
 
 			for _, p := range products {
-				productsCh <- p
+				select {
+				case productsCh <- p:
+				case <-ctx:
+					return
+				}
 			}
 			fmt.Printf("Страница %d готова, товаров: %d\n", page, len(products))
 		}(i)
@@ -236,17 +278,19 @@ func main() {
 	}()
 
 	count := 0
+
 	for product := range productsCh {
 		batchWriter.Add(product)
 		count++
-		
+
 		if count%50 == 0 {
-			fmt.Printf("📊 Прогресс: собрано %d товаров\n", count)
+			fmt.Printf("Прогресс: собрано %d товаров\n", count)
 		}
 	}
+
 	elapsed := time.Since(startTime)
-	fmt.Printf("\nГотово!\n")
-	fmt.Printf("   Собрано товаров: %d\n", count)
-	fmt.Printf("   Затрачено времени: %v\n", elapsed)
-	fmt.Printf("   Данные сохранены в data/products.json (пакетная запись)\n")
+
+	fmt.Printf("\nСобрано товаров: %d\n", count)
+	fmt.Printf("Затрачено времени: %v\n", elapsed)
+	fmt.Println("Данные сохранены в data/products.json")
 }
