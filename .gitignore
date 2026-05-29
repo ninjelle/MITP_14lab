@@ -2,16 +2,29 @@
 data/
 *.json
 *.parquet
-*.csv
-
-# Логи
+*.png
 *.log
 
-# Временные файлы
-tmp/
-temp/
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+ENV/
+.pytest_cache/
+.coverage
+
+# Go
+collector/collector
+collector/collector.exe
+*.exe
 
 # IDE
 .idea/
 .vscode/
 *.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
