@@ -1,0 +1,17 @@
+# Сгенерированные данные
+data/
+*.json
+*.parquet
+*.csv
+
+# Логи
+*.log
+
+# Временные файлы
+tmp/
+temp/
+
+# IDE
+.idea/
+.vscode/
+*.swp
