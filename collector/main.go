@@ -14,11 +14,98 @@ import (
 )
 
 type Product struct {
-	Title     string    `json:"title"`
-	Price     string    `json:"price"`
-	Rating    string    `json:"rating"`
-	PageURL   string    `json:"page_url"`
+	Title       string    `json:"title"`
+	Price       string    `json:"price"`
+	Rating      string    `json:"rating"`
+	PageURL     string    `json:"page_url"`
 	CollectedAt time.Time `json:"collected_at"`
+}
+
+type BatchWriter struct {
+	file        *os.File
+	buffer      []Product
+	bufferSize  int         
+	flushInterval time.Duration 
+	ticker      *time.Ticker
+	mu          sync.Mutex
+	stopCh      chan struct{}
+}
+
+func NewBatchWriter(filename string, bufferSize int, flushInterval time.Duration) (*BatchWriter, error) {
+	
+	os.MkdirAll("../data", 0755)
+	
+	file, err := os.Create(filename)
+	if err != nil {
+		return nil, err
+	}
+
+	bw := &BatchWriter{
+		file:          file,
+		buffer:        make([]Product, 0, bufferSize),
+		bufferSize:    bufferSize,
+		flushInterval: flushInterval,
+		ticker:        time.NewTicker(flushInterval),
+		stopCh:        make(chan struct{}),
+	}
+
+	go bw.autoFlush()
+
+	return bw, nil
+}
+
+func (bw *BatchWriter) Add(product Product) {
+	bw.mu.Lock()
+	defer bw.mu.Unlock()
+
+	bw.buffer = append(bw.buffer, product)
+
+	if len(bw.buffer) >= bw.bufferSize {
+		bw.flush()
+	}
+}
+
+func (bw *BatchWriter) flush() {
+	if len(bw.buffer) == 0 {
+		return
+	}
+
+	for _, product := range bw.buffer {
+		data, err := json.Marshal(product)
+		if err != nil {
+			log.Printf("Ошибка маршалинга: %v", err)
+			continue
+		}
+		bw.file.Write(data)
+		bw.file.WriteString("\n")
+	}
+
+	fmt.Printf("📦 Сброшено в файл: %d записей\n", len(bw.buffer))
+	bw.buffer = bw.buffer[:0] // очищаем буфер
+}
+
+func (bw *BatchWriter) autoFlush() {
+	for {
+		select {
+		case <-bw.ticker.C:
+			bw.mu.Lock()
+			bw.flush()
+			bw.mu.Unlock()
+		case <-bw.stopCh:
+			return
+		}
+	}
+}
+
+func (bw *BatchWriter) Close() error {
+	bw.ticker.Stop()
+	close(bw.stopCh)
+
+	bw.mu.Lock()
+	defer bw.mu.Unlock()
+	bw.flush()
+
+	return bw.file.Close()
 }
 
 func parsePage(pageNum int) ([]Product, error) {
@@ -88,7 +175,6 @@ func extractProduct(n *html.Node, pageURL string) Product {
 							p.Price = node.FirstChild.Data
 						}
 					}
-					// Рейтинг — в <p class="star-rating One/Two/...">
 					if attr.Key == "class" && strings.Contains(attr.Val, "star-rating") {
 						parts := strings.Split(attr.Val, " ")
 						if len(parts) == 2 {
@@ -108,11 +194,21 @@ func extractProduct(n *html.Node, pageURL string) Product {
 }
 
 func main() {
-	totalPages := 5
+	totalPages := 20
+	
+	batchWriter, err := NewBatchWriter("../data/products.json", 10, 3*time.Second)
+	if err != nil {
+		log.Fatal("Не могу создать BatchWriter:", err)
+	}
+	defer batchWriter.Close()
 
 	productsCh := make(chan Product, 200)
-
 	var wg sync.WaitGroup
+
+	fmt.Println("🚀 Запуск параллельного сбора данных...")
+	fmt.Printf("   Пакетная запись: %d записей или каждые %v\n\n", 10, 3*time.Second)
+
+	startTime := time.Now()
 
 	for i := 1; i <= totalPages; i++ {
 		wg.Add(1)
@@ -136,27 +232,21 @@ func main() {
 	go func() {
 		wg.Wait()
 		close(productsCh)
+		fmt.Println("\nВсе страницы обработаны, завершаем сбор...")
 	}()
-
-	os.MkdirAll("../data", 0755)
-	file, err := os.Create("../data/products.json")
-	if err != nil {
-		log.Fatal("Не могу создать файл:", err)
-	}
-	defer file.Close()
 
 	count := 0
 	for product := range productsCh {
-		data, err := json.Marshal(product)
-		if err != nil {
-			log.Printf("Ошибка маршалинга: %v", err)
-			continue
-		}
-		file.Write(data)
-		file.WriteString("\n")
+		batchWriter.Add(product)
 		count++
+		
+		if count%50 == 0 {
+			fmt.Printf("📊 Прогресс: собрано %d товаров\n", count)
+		}
 	}
-
-	fmt.Printf("\nГотово! Собрано товаров: %d\n", count)
-	fmt.Println("Данные сохранены в data/products.json")
+	elapsed := time.Since(startTime)
+	fmt.Printf("\nГотово!\n")
+	fmt.Printf("   Собрано товаров: %d\n", count)
+	fmt.Printf("   Затрачено времени: %v\n", elapsed)
+	fmt.Printf("   Данные сохранены в data/products.json (пакетная запись)\n")
 }
