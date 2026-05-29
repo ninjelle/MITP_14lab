@@ -1,0 +1,3 @@
+polars>=0.20.0
+duckdb>=0.9.0
+matplotlib>=3.7.0
